@@ -216,3 +216,23 @@ async def mailroom_agent(req: Dict[str, Any]):
 
     else:
         raise HTTPException(status_code=400, detail="Invalid operation")
+
+
+@app.post("/propose")
+async def propose_endpoint(req: Dict[str, Any]):
+    if req.get("operation") != "propose":
+        raise HTTPException(status_code=400, detail="Invalid operation for /propose")
+
+    return handle_propose(req)
+
+
+# ----------------------------
+# COMMIT ENDPOINT (FIX)
+# ----------------------------
+
+@app.post("/commit")
+async def commit_endpoint(req: Dict[str, Any]):
+    if req.get("operation") != "commit":
+        raise HTTPException(status_code=400, detail="Invalid operation for /commit")
+
+    return handle_commit(req)
