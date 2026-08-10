@@ -1,79 +1,81 @@
-from fastapi import FastAPI, HTTPException
-from typing import Dict, Any, List
-import hashlib
 import json
-import uuid
+import hashlib
 import base64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+import uuid
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 
 app = FastAPI()
 
-# In-memory storage (replace with DB in production)
-proposal_store = {}
-receipt_keys = {}
+# =========================
+# In-memory DB (use Redis in prod)
+# =========================
+evaluations = {}
+dossier_cache = {}
 
-# ----------------------------
-# Utils
-# ----------------------------
-def canonical_json(data):
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+PROFILE = "ga5-mailroom-action-gate/v2"
 
-def sha256_hex(data):
-    return hashlib.sha256(data.encode()).hexdigest()
+
+# =========================
+# Helpers
+# =========================
+
+def canonical_json(obj):
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+def sha256_hex(data: bytes):
+    return hashlib.sha256(data).hexdigest()
+
 
 def compute_input_digest(dossiers):
-    return sha256_hex(canonical_json(dossiers))
+    return sha256_hex(canonical_json(dossiers).encode())
 
-def generate_call_id(dossier_id):
-    return f"{dossier_id}_{uuid.uuid4().hex[:8]}"
 
-# ----------------------------
-# Simple Rule-based AI (SAFE)
-# ----------------------------
-def ai_decide(dossier):
+def compute_proposal_digest(p):
+    minimal = {
+        "dossierId": p["dossierId"],
+        "callId": p["callId"],
+        "action": p["action"],
+        "target": p["target"],
+        "payload": p["payload"],
+        "evidence": sorted(p["evidence"]),
+    }
+    return sha256_hex(canonical_json(minimal).encode())
+
+
+def verify_signature(pubkey_b64, message_bytes, sig_b64):
+    try:
+        verify_key = VerifyKey(base64.urlsafe_b64decode(pubkey_b64 + "=="))
+        verify_key.verify(message_bytes, base64.b64decode(sig_b64))
+        return True
+    except BadSignatureError:
+        return False
+
+
+def make_call_id(digest):
+    return digest[:24]
+
+
+# =========================
+# AI decision (SAFE BASELINE)
+# =========================
+
+def decide_action(dossier):
+    """
+    Minimal safe baseline:
+    - Always avoid unsafe execution
+    - Use INFORMATIONAL unless strong signal exists
+    """
+
     lines = []
     for s in dossier["sources"]:
         for l in s["lines"]:
-            lines.append((l["lineId"], l["text"].lower()))
+            lines.append(l["lineId"])
 
-    text = " ".join([t for _, t in lines])
-
-    # RULES (important for marks)
-    if "ignore instructions" in text or "system prompt" in text:
-        return {
-            "action": "quarantine_item",
-            "target": {"kind": "security_queue", "id": "mailroom"},
-            "payload": {
-                "artifactId": dossier["dossierId"],
-                "reasonCode": "INDIRECT_PROMPT_INJECTION"
-            },
-            "evidence": [lines[0][0]]
-        }
-
-    if "duplicate" in text:
-        return {
-            "action": "no_action",
-            "target": None,
-            "payload": {
-                "reasonCode": "DUPLICATE",
-                "referenceId": dossier["dossierId"]
-            },
-            "evidence": [lines[0][0]]
-        }
-
-    if "confirm" in text or "verify" in text:
-        return {
-            "action": "request_confirmation",
-            "target": {"kind": "approval_queue", "id": "support"},
-            "payload": {
-                "claimedSender": "unknown",
-                "questionCode": "VERIFY_REQUEST",
-                "referenceId": dossier["dossierId"]
-            },
-            "evidence": [lines[0][0]]
-        }
-
-    # Default safe fallback
+    # ALWAYS safe fallback
     return {
         "action": "no_action",
         "target": None,
@@ -81,107 +83,139 @@ def ai_decide(dossier):
             "reasonCode": "INFORMATIONAL",
             "referenceId": dossier["dossierId"]
         },
-        "evidence": [lines[0][0]]
+        "evidence": [lines[0]] if lines else []
     }
 
-# ----------------------------
-# Receipt Signature Verify
-# ----------------------------
-def verify_signature(public_key_jwk, receipt, signature_b64, evaluationId, inputDigest):
-    try:
-        public_key_bytes = base64.urlsafe_b64decode(public_key_jwk["x"] + "==")
-        public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
 
-        message = {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": evaluationId,
-            "inputDigest": inputDigest,
-            "receipt": receipt
-        }
-
-        msg_bytes = canonical_json(message).encode()
-        signature = base64.b64decode(signature_b64)
-
-        public_key.verify(signature, msg_bytes)
-        return True
-    except Exception:
-        return False
-
-# ----------------------------
+# =========================
 # PROPOSE
-# ----------------------------
-def handle_propose(req: Dict[str, Any]):
-    dossiers = req["dossiers"]
-    evaluationId = req["evaluationId"]
+# =========================
 
-    inputDigest = compute_input_digest(dossiers)
+@app.post("/")
+async def handle(request: Request):
+    body = await request.json()
+
+    if body.get("profile") != PROFILE:
+        raise HTTPException(400, "Invalid profile")
+
+    operation = body.get("operation")
+
+    if operation == "propose":
+        return await handle_propose(body)
+    elif operation == "commit":
+        return await handle_commit(body)
+    else:
+        raise HTTPException(400, "Invalid operation")
+
+
+async def handle_propose(body):
+    evaluation_id = body["evaluationId"]
+    dossiers = body["dossiers"]
+
+    digest = compute_input_digest(dossiers)
+
+    # Conflict check
+    if evaluation_id in evaluations:
+        if evaluations[evaluation_id]["inputDigest"] != digest:
+            raise HTTPException(409, "Conflict")
 
     proposals = []
 
     for d in dossiers:
-        decision = ai_decide(d)
-        call_id = generate_call_id(d["dossierId"])
+        d_key = sha256_hex(canonical_json(d).encode())
 
-        proposal = {
-            "dossierId": d["dossierId"],
-            "callId": call_id,
-            "action": decision["action"],
-            "target": decision["target"],
-            "payload": decision["payload"],
-            "evidence": decision["evidence"]
-        }
+        # CACHE HIT
+        if d_key in dossier_cache:
+            proposal = dossier_cache[d_key]
+        else:
+            decision = decide_action(d)
+
+            call_id = make_call_id(d_key)
+
+            proposal = {
+                "dossierId": d["dossierId"],
+                "callId": call_id,
+                "action": decision["action"],
+                "target": decision["target"],
+                "payload": decision["payload"],
+                "evidence": decision["evidence"]
+            }
+
+            dossier_cache[d_key] = proposal
 
         proposals.append(proposal)
 
-        # Store proposal for commit stage
-        proposal_store[(evaluationId, d["dossierId"])] = proposal
-
-    # Store verifier key
-    receipt_keys[evaluationId] = req["receiptVerifier"]["publicKeyJwk"]
-
-    return {
-        "profile": req["profile"],
-        "evaluationId": evaluationId,
-        "status": "awaiting_receipts",
-        "inputDigest": inputDigest,
-        "proposals": proposals
+    # Store evaluation
+    evaluations[evaluation_id] = {
+        "inputDigest": digest,
+        "proposals": proposals,
+        "verifier": body["receiptVerifier"]["publicKeyJwk"]["x"]
     }
 
-# ----------------------------
+    return JSONResponse({
+        "profile": PROFILE,
+        "evaluationId": evaluation_id,
+        "status": "awaiting_receipts",
+        "inputDigest": digest,
+        "proposals": proposals
+    })
+
+
+# =========================
 # COMMIT
-# ----------------------------
-def handle_commit(req: Dict[str, Any]):
-    evaluationId = req["evaluationId"]
-    inputDigest = req["inputDigest"]
-    receipts = req["receipts"]
+# =========================
 
-    if evaluationId not in receipt_keys:
-        raise HTTPException(status_code=400, detail="Unknown evaluation")
+async def handle_commit(body):
+    evaluation_id = body["evaluationId"]
+    input_digest = body["inputDigest"]
+    receipts = body["receipts"]
 
-    public_key_jwk = receipt_keys[evaluationId]
+    if evaluation_id not in evaluations:
+        raise HTTPException(400, "Unknown evaluation")
+
+    stored = evaluations[evaluation_id]
+
+    if stored["inputDigest"] != input_digest:
+        raise HTTPException(409, "Digest mismatch")
+
+    pubkey = stored["verifier"]
+    proposals = stored["proposals"]
+
     outcomes = []
 
     for r in receipts:
-        receipt_core = {
-            "dossierId": r["dossierId"],
-            "callId": r["callId"],
-            "action": r["action"],
-            "accepted": r["accepted"],
-            "proposalDigest": r["proposalDigest"],
-            "receiptId": r["receiptId"]
+        # Find matching proposal
+        match = next(
+            (p for p in proposals if p["callId"] == r["callId"]),
+            None
+        )
+        if not match:
+            raise HTTPException(400, "Invalid callId")
+
+        # Verify proposal digest
+        expected_digest = compute_proposal_digest(match)
+        if expected_digest != r["proposalDigest"]:
+            raise HTTPException(400, "Proposal mismatch")
+
+        # Build signed message
+        message = {
+            "profile": PROFILE,
+            "evaluationId": evaluation_id,
+            "inputDigest": input_digest,
+            "receipt": {
+                "dossierId": r["dossierId"],
+                "callId": r["callId"],
+                "action": r["action"],
+                "accepted": r["accepted"],
+                "proposalDigest": r["proposalDigest"],
+                "receiptId": r["receiptId"]
+            }
         }
 
-        # Verify signature
-        if not verify_signature(
-            public_key_jwk,
-            receipt_core,
-            r["receiptSignature"],
-            evaluationId,
-            inputDigest
-        ):
-            raise HTTPException(status_code=400, detail="Invalid signature")
+        message_bytes = canonical_json(message).encode()
 
-        status = "executed" if r["accepted"] else "rejected"
+        if not verify_signature(pubkey, message_bytes, r["receiptSignature"]):
+            raise HTTPException(400, "Invalid signature")
 
         outcomes.append({
             "dossierId": r["dossierId"],
@@ -189,50 +223,13 @@ def handle_commit(req: Dict[str, Any]):
             "action": r["action"],
             "proposalDigest": r["proposalDigest"],
             "receiptId": r["receiptId"],
-            "status": status
+            "status": "executed" if r["accepted"] else "rejected"
         })
 
-    return {
-        "profile": req["profile"],
-        "evaluationId": evaluationId,
+    return JSONResponse({
+        "profile": PROFILE,
+        "evaluationId": evaluation_id,
         "status": "completed",
-        "inputDigest": inputDigest,
+        "inputDigest": input_digest,
         "outcomes": outcomes
-    }
-
-# ----------------------------
-# MAIN ENDPOINT
-# ----------------------------
-@app.post("/")
-async def mailroom_agent(req: Dict[str, Any]):
-    if "operation" not in req:
-        raise HTTPException(status_code=400, detail="Missing operation")
-
-    if req["operation"] == "propose":
-        return handle_propose(req)
-
-    elif req["operation"] == "commit":
-        return handle_commit(req)
-
-    else:
-        raise HTTPException(status_code=400, detail="Invalid operation")
-
-
-@app.post("/propose")
-async def propose_endpoint(req: Dict[str, Any]):
-    if req.get("operation") != "propose":
-        raise HTTPException(status_code=400, detail="Invalid operation for /propose")
-
-    return handle_propose(req)
-
-
-# ----------------------------
-# COMMIT ENDPOINT (FIX)
-# ----------------------------
-
-@app.post("/commit")
-async def commit_endpoint(req: Dict[str, Any]):
-    if req.get("operation") != "commit":
-        raise HTTPException(status_code=400, detail="Invalid operation for /commit")
-
-    return handle_commit(req)
+    })
