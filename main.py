@@ -49,6 +49,8 @@ _model_diagnostics: dict[str, Any] = {
     "fallbackProposals": 0,
     "lastFailure": "none",
     "lastHttpStatus": None,
+    "lastCandidateAction": "none",
+    "lastValidationErrors": "none",
 }
 DB_PATH = Path(os.getenv("MAILROOM_DB_PATH", str(Path(__file__).with_name("mailroom.sqlite3"))))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -771,10 +773,15 @@ async def _decide_batch(
                 continue
             candidate = candidates_by_id.get(dossier_id)
             if candidate is None:
+                _model_diagnostics["lastCandidateAction"] = "missing"
                 invalid[dossier_id] = "missing_proposal"
                 continue
             try:
                 normalized = _normalize_candidate(candidate)
+                candidate_action = normalized.get("action")
+                _model_diagnostics["lastCandidateAction"] = (
+                    candidate_action if candidate_action in ALLOWED_ACTIONS else "unknown"
+                )
                 decisions[dossier_id] = _validate_proposal(
                     normalized,
                     typed[dossier_id],
@@ -787,6 +794,11 @@ async def _decide_batch(
         if invalid:
             _model_diagnostics["invalidCandidates"] += len(invalid)
             _model_diagnostics["lastFailure"] = "candidate_validation"
+            safe_codes = sorted({
+                code for code in invalid.values()
+                if re.fullmatch(r"[a-z_]{1,60}", code)
+            })
+            _model_diagnostics["lastValidationErrors"] = ",".join(safe_codes[:10]) or "other"
         last_error = ";".join(f"{dossier_id}:{code}" for dossier_id, code in invalid.items())[:500]
         correction = last_error
 
@@ -1112,4 +1124,6 @@ def health() -> dict[str, str]:
         "fallbackProposals": str(_model_diagnostics["fallbackProposals"]),
         "lastFailure": str(_model_diagnostics["lastFailure"]),
         "lastHttpStatus": str(_model_diagnostics["lastHttpStatus"] or "none"),
+        "lastCandidateAction": str(_model_diagnostics["lastCandidateAction"]),
+        "lastValidationErrors": str(_model_diagnostics["lastValidationErrors"]),
     }
