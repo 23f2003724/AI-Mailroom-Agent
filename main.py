@@ -23,7 +23,7 @@ PROFILE = "ga5-mailroom-action-gate/v2"
 MAX_REQUEST_BYTES = 6 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
 MAX_MODEL_OUTPUT_CHARS = 350_000
-DECISION_CACHE_REVISION = "2026-10-31-authority-v2"
+DECISION_CACHE_REVISION = "2026-10-31-authority-v3"
 MODEL_BATCH_SIZE = 6
 MODEL_CONCURRENCY = 8
 MODEL_ATTEMPTS = 4
@@ -42,10 +42,18 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("mailroom")
 _proposal_lock = asyncio.Lock()
 _model_semaphore = asyncio.Semaphore(MODEL_CONCURRENCY)
+_model_diagnostics: dict[str, Any] = {
+    "calls": 0,
+    "providerErrors": 0,
+    "invalidCandidates": 0,
+    "fallbackProposals": 0,
+    "lastFailure": "none",
+    "lastHttpStatus": None,
+}
 DB_PATH = Path(os.getenv("MAILROOM_DB_PATH", str(Path(__file__).with_name("mailroom.sqlite3"))))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.1.0", docs_url=None, redoc_url=None)
 
 
 class StrictModel(BaseModel):
@@ -587,15 +595,19 @@ def _model_prompt(dossiers: list[dict[str, Any]], correction: str | None = None)
 async def _ask_aipipe(dossiers: list[dict[str, Any]], correction: str | None, timeout_seconds: float) -> str:
     api_key = os.getenv("AIPIPE_API_KEY")
     if api_key:
+        _model_diagnostics["provider"] = "aipipe"
         base_url = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
         model = os.getenv("AIPIPE_MODEL", "openai/gpt-4.1-nano")
     else:
         # Keep a working path when the Render service only has its pre-existing OpenRouter secret.
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
+            _model_diagnostics["provider"] = "none"
             raise RuntimeError("No AIPipe or OpenRouter API key is configured")
+        _model_diagnostics["provider"] = "openrouter"
         base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-nano")
+    _model_diagnostics["model"] = model
     payload = {
         "model": model,
         "messages": [
@@ -616,8 +628,12 @@ async def _ask_aipipe(dossiers: list[dict[str, Any]], correction: str | None, ti
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     timeout = httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds))
     async with httpx.AsyncClient(timeout=timeout) as client:
+        _model_diagnostics["calls"] += 1
         response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
-    response.raise_for_status()
+    _model_diagnostics["lastHttpStatus"] = response.status_code
+    if response.is_error:
+        _model_diagnostics["lastFailure"] = "provider_http_error"
+        raise RuntimeError(f"provider_http_{response.status_code}")
     result = response.json()
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str) or len(content) > MAX_MODEL_OUTPUT_CHARS:
@@ -727,6 +743,8 @@ async def _decide_batch(
             candidates = _parse_model_output(content)
         except Exception as exc:
             last_error = f"provider_or_parse:{type(exc).__name__}"
+            _model_diagnostics["providerErrors"] += 1
+            _model_diagnostics["lastFailure"] = f"provider_or_parse:{type(exc).__name__}"
             correction = "Return a JSON proposals array with one exact proposal per dossier."
             continue
 
@@ -766,6 +784,9 @@ async def _decide_batch(
                 invalid[dossier_id] = str(exc)[:100]
 
         pending = {dossier_id: pending[dossier_id] for dossier_id in invalid}
+        if invalid:
+            _model_diagnostics["invalidCandidates"] += len(invalid)
+            _model_diagnostics["lastFailure"] = "candidate_validation"
         last_error = ";".join(f"{dossier_id}:{code}" for dossier_id, code in invalid.items())[:500]
         correction = last_error
 
@@ -780,6 +801,9 @@ async def _decide_batch(
             logger.error("Fallback failed: %s", type(exc).__name__)
             raise RuntimeError("Could not construct a safe proposal") from exc
     if pending:
+        _model_diagnostics["fallbackProposals"] += len(pending)
+        if _model_diagnostics["lastFailure"] == "none":
+            _model_diagnostics["lastFailure"] = "model_attempts_exhausted"
         logger.warning("AIPipe proposal retries exhausted: count=%d reason=%s", len(pending), last_error)
     return decisions
 
@@ -1074,4 +1098,18 @@ async def mailroom_actions(request: Request) -> JSONResponse:
 @app.get("/")
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    configured = bool(os.getenv("AIPIPE_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+    return {
+        "status": "ok",
+        "version": app.version,
+        "build": os.getenv("RENDER_GIT_COMMIT", "unknown")[:12],
+        "modelConfigured": str(configured).lower(),
+        "modelProvider": str(_model_diagnostics.get("provider", "configured" if configured else "none")),
+        "model": str(_model_diagnostics.get("model", os.getenv("AIPIPE_MODEL", os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-nano")))),
+        "modelCalls": str(_model_diagnostics["calls"]),
+        "providerErrors": str(_model_diagnostics["providerErrors"]),
+        "invalidCandidates": str(_model_diagnostics["invalidCandidates"]),
+        "fallbackProposals": str(_model_diagnostics["fallbackProposals"]),
+        "lastFailure": str(_model_diagnostics["lastFailure"]),
+        "lastHttpStatus": str(_model_diagnostics["lastHttpStatus"] or "none"),
+    }
