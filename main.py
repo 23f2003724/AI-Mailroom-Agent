@@ -23,7 +23,7 @@ PROFILE = "ga5-mailroom-action-gate/v2"
 MAX_REQUEST_BYTES = 6 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
 MAX_MODEL_OUTPUT_CHARS = 350_000
-DECISION_CACHE_REVISION = "2026-10-31-authority-v5"
+DECISION_CACHE_REVISION = "2026-10-31-authority-v6"
 MODEL_BATCH_SIZE = 6
 MODEL_CONCURRENCY = 8
 MODEL_ATTEMPTS = 4
@@ -55,7 +55,7 @@ _model_diagnostics: dict[str, Any] = {
 DB_PATH = Path(os.getenv("MAILROOM_DB_PATH", str(Path(__file__).with_name("mailroom.sqlite3"))))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.3.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.4.0", docs_url=None, redoc_url=None)
 
 
 class StrictModel(BaseModel):
@@ -489,7 +489,7 @@ def _validate_proposal(raw: dict[str, Any], dossier: Dossier, fingerprint: str) 
             raise ValueError("no_action_target")
         if payload["reasonCode"] not in {"ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"}:
             raise ValueError("no_action_reason")
-        if not _contains(cited_text, payload["referenceId"]):
+        if payload["referenceId"] != dossier.dossierId and not _contains(cited_text, payload["referenceId"]):
             raise ValueError("no_action_reference_not_cited")
 
     arguments = list(payload.values())
@@ -712,6 +712,102 @@ _ATTACK = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_REFERENCE_TOKEN = re.compile(
+    r"\b[A-Z]{2,10}[-_][A-Z0-9]{2,}\b|(?<!\w)#[0-9]{3,}\b|"
+    r"\b(?:ORDER|CASE|REF(?:ERENCE)?|TICKET|INVOICE|SHIPMENT)\s+(?:ID|NO\.?|NUMBER)\s*[:=#-]?\s*[A-Z0-9][A-Z0-9_-]{2,}\b",
+    re.IGNORECASE,
+)
+
+
+def _fallback_reference(dossier: Dossier) -> tuple[str, str] | None:
+    for source in dossier.sources:
+        for line in source.lines:
+            for match in _REFERENCE_TOKEN.finditer(line.text):
+                reference_id = match.group(0).strip()
+                if any(marker in reference_id.casefold() for marker in ("vault", "secret", "canary", "token", "password")):
+                    continue
+                return reference_id, line.lineId
+    return None
+
+
+def _fallback_create_draft(dossier: Dossier, fingerprint: str) -> dict[str, Any] | None:
+    request_language = re.compile(
+        r"\b(?:please|can you|could you|would you|tell me|let me know|want to know|wondering|"
+        r"looking for|what(?:'s| is)|where is|status update|update me)\b",
+        re.IGNORECASE,
+    )
+    context = f"{dossier.objective}\n" + "\n".join(
+        line.text for source in dossier.sources for line in source.lines
+    )
+    if not request_language.search(context) or not re.search(r"\b(status|order|delivery|shipment)\b", context, re.IGNORECASE):
+        return None
+
+    for customer_source in dossier.sources:
+        if _trusted(customer_source):
+            continue
+        sender_lines: list[tuple[SourceLine, str]] = []
+        for line in customer_source.lines:
+            for match in re.finditer(
+                r"\b(?:from|sender)\s*[:=]?\s*<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?",
+                line.text,
+                re.IGNORECASE,
+            ):
+                sender_lines.append((line, match.group(1)))
+        if not sender_lines:
+            continue
+
+        for request_line in customer_source.lines:
+            if not request_language.search(request_line.text):
+                continue
+            reference = next(
+                (match.group(0).strip() for match in _REFERENCE_TOKEN.finditer(request_line.text)),
+                None,
+            )
+            if not reference:
+                continue
+            for sender_line, sender in sender_lines:
+                for record_source in dossier.sources:
+                    descriptor = f"{record_source.kind} {record_source.provenance} {record_source.title}".casefold()
+                    if not _trusted(record_source) or not any(
+                        marker in descriptor for marker in ("current", "status", "record", "order", "shipment", "tracking")
+                    ):
+                        continue
+                    if re.search(r"\b(previous|old|stale|superseded|historical|archived)\b", descriptor):
+                        continue
+                    for record_line in record_source.lines:
+                        if not _contains(record_line.text, reference) or re.search(
+                            r"\b(previous|old|stale|superseded|historical|archived)\b",
+                            record_line.text,
+                            re.IGNORECASE,
+                        ):
+                            continue
+                        status_match = re.search(
+                            r"\bstatus\b[^:=.\n]{0,60}(?:is|=|:)\s*([^,.;\n]{2,60})",
+                            record_line.text,
+                            re.IGNORECASE,
+                        )
+                        if not status_match:
+                            continue
+                        status = status_match.group(1).strip(" \t.\n\r:;,-")
+                        evidence = list(dict.fromkeys((sender_line.lineId, request_line.lineId, record_line.lineId)))
+                        candidate = {
+                            "dossierId": dossier.dossierId,
+                            "action": "create_draft",
+                            "target": {"kind": "draft_queue", "id": f"mailbox:{dossier.mailbox}"},
+                            "payload": {
+                                "recipient": sender,
+                                "referenceId": reference,
+                                "status": status,
+                                "template": "order_status",
+                            },
+                            "evidence": evidence,
+                        }
+                        try:
+                            return _validate_proposal(candidate, dossier, fingerprint)
+                        except ValueError:
+                            continue
+    return None
+
 
 def _fallback_proposal(dossier: Dossier, fingerprint: str) -> dict[str, Any]:
     for source in dossier.sources:
@@ -731,13 +827,19 @@ def _fallback_proposal(dossier: Dossier, fingerprint: str) -> dict[str, Any]:
                 except ValueError:
                     pass
 
+    draft = _fallback_create_draft(dossier, fingerprint)
+    if draft:
+        return draft
+
     first_line = next(line for source in dossier.sources for line in source.lines)
+    fallback_reference = _fallback_reference(dossier)
+    reference_id, evidence_line = fallback_reference or (dossier.dossierId, first_line.lineId)
     candidate = {
         "dossierId": dossier.dossierId,
         "action": "no_action",
         "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier.mailbox},
-        "evidence": [first_line.lineId],
+        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": reference_id},
+        "evidence": [evidence_line],
     }
     return _validate_proposal(candidate, dossier, fingerprint)
 
